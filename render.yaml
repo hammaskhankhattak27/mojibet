@@ -1,0 +1,33 @@
+# render.yaml — Free Web Service using Docker + SQLite
+# NOTE: On Render free, the filesystem resets on *deploys*.
+# Attach a paid disk if you need durable SQLite across deploys.
+
+services:
+  - type: web
+    name: mojibet-bot
+    env: docker
+    plan: free
+    region: oregon            # change if needed
+    autoDeploy: true
+    previewsEnabled: false
+    healthCheckPath: "/"
+
+    envVars:
+      - key: SQLITE_PATH
+        value: /app/data/mojibet.db
+
+      # --- Secrets: set these in the Render dashboard after first deploy ---
+      - key: BOT_TOKEN
+        sync: false
+      - key: BOT_PRIVATE_KEY
+        sync: false
+      - key: HOUSE_PRIVATE_KEY         # optional; code falls back to BOT_PRIVATE_KEY
+        sync: false
+      - key: HOUSE_WALLET
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: SUPPORT_USERNAME
+        value: YourSupportHandle
+      - key: SOLANA_RPC
+        value: https://api.devnet.solana.com
