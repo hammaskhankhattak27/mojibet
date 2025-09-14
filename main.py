@@ -1,10 +1,10 @@
 import os
-import time
 import random
 import json
 import logging
+import time
 from decimal import Decimal
-from hashlib import sha256
+from hashlib import sha256  # (still used elsewhere, not for keygen)
 from base58 import b58encode, b58decode
 from dotenv import load_dotenv
 
@@ -24,7 +24,6 @@ import sys
 import threading
 from typing import Optional
 from pathlib import Path
-import sqlite3
 
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
@@ -50,21 +49,15 @@ logger = logging.getLogger(__name__)
 # === ENV & CONSTANTS ===
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.devnet.solana.com")
+# MAINNET by default; you may override with your provider (Jito, Helius, Triton, QuickNode, etc.)
+SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+
 BOT_PRIVATE_KEY = os.getenv("BOT_PRIVATE_KEY")
 HOUSE_WALLET = os.getenv("HOUSE_WALLET")
-# OPTIONAL: payouts/refunds from house — alias to BOT_PRIVATE_KEY if unset
-HOUSE_PRIVATE_KEY = os.getenv("HOUSE_PRIVATE_KEY") or os.getenv("BOT_PRIVATE_KEY")
+HOUSE_PRIVATE_KEY = os.getenv("HOUSE_PRIVATE_KEY")  # OPTIONAL: payouts/refunds from house
 
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "YourSupportHandle")  # no '@'
-try:
-    OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
-except ValueError:
-    OWNER_ID = 0
-
-# SQLite path; persisted within container FS (ephemeral on redeploys in Render free)
-SQLITE_PATH = os.getenv("SQLITE_PATH", "data/mojibet.db")
-Path(SQLITE_PATH).parent.mkdir(parents=True, exist_ok=True)
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN")
@@ -73,13 +66,32 @@ if not BOT_PRIVATE_KEY:
 if not HOUSE_WALLET:
     raise RuntimeError("Missing HOUSE_WALLET (Solana address)")
 
+# Validate keys early (fail fast)
+try:
+    _tmp_signer = Keypair.from_bytes(b58decode(BOT_PRIVATE_KEY))
+except Exception:
+    raise RuntimeError("BOT_PRIVATE_KEY must be base58 of the raw secret key bytes (usually 64 bytes).")
+try:
+    _ = Pubkey.from_string(HOUSE_WALLET)
+except Exception:
+    raise RuntimeError("HOUSE_WALLET is not a valid Solana public key.")
+if HOUSE_PRIVATE_KEY:
+    try:
+        _ = Keypair.from_bytes(b58decode(HOUSE_PRIVATE_KEY))
+    except Exception:
+        raise RuntimeError("HOUSE_PRIVATE_KEY (if set) must be base58 of the raw secret key bytes.")
+
 HOUSE_FEE_RATE = Decimal("0.05")          # 5% house fee (user-facing text never shows this)
 INACTIVITY_TIMEOUT_SECS = 5 * 60          # 5 minutes
+SWEEP_KEEP_LAMPORTS = 50_000              # ~0.00005 SOL safety buffer
 FEE_BUFFER_LAMPORTS = 100_000             # extra fee cushion for payouts (~0.0001 SOL)
 
-games = {}        # gid -> game data (in-memory, active games only)
-user_games = {}   # uid -> gid (in-memory, active games only)
-used_txs = set()  # fast in-memory cache, persisted in SQLite
+GAMES_FILE = "game_keys.json"
+USED_TX_FILE = "used_txs.json"
+
+games = {}        # gid -> game data (in-memory)
+user_games = {}   # uid -> gid (limit a user to 1 concurrent game)
+used_txs = set()  # globally accepted tx signatures
 game_locks = {}   # gid -> asyncio.Lock()
 
 # serialize payouts to avoid double-spends/nonce issues under load
@@ -100,158 +112,106 @@ def _get_payout_signer() -> Keypair:
     """Prefer house wallet for payouts/refunds if provided; otherwise use bot signer."""
     return house_signer or signer
 
-# === NEW: SQLite helpers & migrations (replaces Postgres) ===
-_sqlite_conn = None
-_sqlite_lock = threading.Lock()
+# === DATABASE (JSON-backed; stats & profile only) ===
+DB_FILE = Path("db.json")
+_db_lock = threading.Lock()
 
-def pg():  # keep the same name so the rest of the code doesn't change
-    global _sqlite_conn
-    with _sqlite_lock:
-        if _sqlite_conn is None:
-            _sqlite_conn = sqlite3.connect(
-                SQLITE_PATH,
-                check_same_thread=False,            # allow access across threads
-                isolation_level=None,               # autocommit mode
-                detect_types=sqlite3.PARSE_DECLTYPES
-            )
-            _sqlite_conn.execute("PRAGMA journal_mode=WAL;")
-            _sqlite_conn.execute("PRAGMA synchronous=NORMAL;")
-            _sqlite_conn.row_factory = sqlite3.Row
-        return _sqlite_conn
-
-def pg_exec(sql: str, params: tuple = (), fetch: str = "none"):
-    conn = pg()
-    cur = conn.cursor()
+def _load_db() -> dict:
+    if not DB_FILE.exists():
+        return {"users": {}}
     try:
-        cur.execute(sql, params)
-        if fetch == "one":
-            row = cur.fetchone()
-            return tuple(row) if row else None
-        elif fetch == "all":
-            rows = cur.fetchall()
-            return [tuple(r) for r in rows]
-        return None
-    finally:
-        cur.close()
+        with DB_FILE.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"DB load error: {e}")
+        return {"users": {}}
 
-def init_db():
-    # Create tables if not exist (SQLite types)
-    pg_exec("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first TEXT,
-        last TEXT
-    );
-    """)
-    pg_exec("""
-    CREATE TABLE IF NOT EXISTS user_stats (
-        user_id INTEGER PRIMARY KEY,
-        wins INTEGER NOT NULL DEFAULT 0,
-        losses INTEGER NOT NULL DEFAULT 0,
-        draws INTEGER NOT NULL DEFAULT 0,
-        net_profit_sol NUMERIC NOT NULL DEFAULT 0,
-        last_played_ts INTEGER NOT NULL DEFAULT 0,
-        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
-    );
-    """)
-    pg_exec("""
-    CREATE TABLE IF NOT EXISTS used_txs (
-        tx TEXT PRIMARY KEY
-    );
-    """)
-    pg_exec("""
-    CREATE TABLE IF NOT EXISTS game_keys (
-        gid INTEGER PRIMARY KEY,
-        priv58 TEXT NOT NULL
-    );
-    """)
-    # prime used_txs cache
-    rows = pg_exec("SELECT tx FROM used_txs", fetch="all") or []
-    used_txs.clear()
-    used_txs.update(tx for (tx,) in rows)
+def _save_db(data: dict):
+    try:
+        with DB_FILE.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"DB save error: {e}")
 
-# === DATABASE (now SQLite) ===
+def _ensure_user(data: dict, user_id: int) -> dict:
+    users = data.setdefault("users", {})
+    u = users.get(str(user_id))
+    if not u:
+        u = {
+            "stats": {"wins": 0, "losses": 0, "draws": 0, "net_profit_sol": "0", "last_played_ts": 0},
+            "profile": {},
+        }
+        users[str(user_id)] = u
+    u.setdefault("stats", {"wins": 0, "losses": 0, "draws": 0, "net_profit_sol": "0", "last_played_ts": 0})
+    u.setdefault("profile", {})
+    return u
+
 class DB:
-    # profile snapshot/upsert
+    def get_user(self, user_id: int) -> dict:
+        with _db_lock:
+            data = _load_db()
+            u = _ensure_user(data, user_id)
+            return u
+
+    # stats & profile only
+    def update_stats(self, user_id: int, *, delta_win=0, delta_loss=0, delta_draw=0, delta_profit_sol=Decimal("0")):
+        with _db_lock:
+            data = _load_db()
+            u = _ensure_user(data, user_id)
+            s = u["stats"]
+            s["wins"] = int(s.get("wins", 0)) + delta_win
+            s["losses"] = int(s.get("losses", 0)) + delta_loss
+            s["draws"] = int(s.get("draws", 0)) + delta_draw
+            cur = Decimal(s.get("net_profit_sol", "0"))
+            s["net_profit_sol"] = str((cur + delta_profit_sol).normalize())
+            # epoch timestamp (not monotonic)
+            s["last_played_ts"] = int(time.time())
+            _save_db(data)
+
     def snapshot_username(self, user_id: int, username: Optional[str], first: Optional[str], last: Optional[str]):
-        # upsert users
-        pg_exec("""
-            INSERT INTO users (user_id, username, first, last)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username=excluded.username,
-                first=excluded.first,
-                last=excluded.last;
-        """, (user_id, username, first, last))
-        # ensure a stats row exists
-        pg_exec("""
-            INSERT INTO user_stats (user_id) VALUES (?)
-            ON CONFLICT(user_id) DO NOTHING;
-        """, (user_id,))
-
-    # stats updates (atomic)
-    def update_stats(self, user_id: int, *, delta_win=0, delta_loss=0, delta_draw=0, delta_profit_sol: Decimal = Decimal("0")):
-        # ensure user rows exist
-        pg_exec("INSERT INTO users (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING;", (user_id,))
-        pg_exec("INSERT INTO user_stats (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING;", (user_id,))
-        # apply increments
-        pg_exec("""
-            UPDATE user_stats
-            SET wins = wins + ?,
-                losses = losses + ?,
-                draws = draws + ?,
-                net_profit_sol = net_profit_sol + ?,
-                last_played_ts = MAX(last_played_ts, ?)
-            WHERE user_id = ?;
-        """, (
-            int(delta_win), int(delta_loss), int(delta_draw),
-            str(delta_profit_sol), int(time.time()), user_id
-        ))
-
-    # leaderboard snapshot (top N)
-    def top_players(self, limit: int = 10):
-        rows = pg_exec("""
-            SELECT u.user_id,
-                   COALESCE(NULLIF(u.username,''), 'user' || CAST(u.user_id AS TEXT)) AS username,
-                   s.wins, s.losses, s.draws, s.net_profit_sol
-            FROM user_stats s
-            JOIN users u ON u.user_id = s.user_id
-            WHERE (s.wins + s.losses + s.draws) > 0
-            ORDER BY s.net_profit_sol DESC, s.wins DESC
-            LIMIT ?;
-        """, (limit,), fetch="all") or []
-        return rows
+        with _db_lock:
+            data = _load_db()
+            u = _ensure_user(data, user_id)
+            u["profile"] = {"username": username, "first": first, "last": last}
+            _save_db(data)
 
 db = DB()
 
-# === UTILS (SQLite-backed) ===
-def store_key(gid: int, kp: Keypair):
+# === UTILS ===
+def _load_used_txs():
+    try:
+        return set(json.load(open(USED_TX_FILE)))
+    except Exception:
+        return set()
+
+def _persist_used_txs():
+    try:
+        json.dump(sorted(list(used_txs)), open(USED_TX_FILE, "w"), indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to persist used txs: {e}")
+
+def store_key(gid, kp):
     priv = b58encode(bytes(kp)).decode()
-    pg_exec("""
-        INSERT INTO game_keys (gid, priv58)
-        VALUES (?, ?)
-        ON CONFLICT(gid) DO UPDATE SET priv58=excluded.priv58;
-    """, (gid, priv))
+    try:
+        data = json.load(open(GAMES_FILE))
+    except Exception:
+        data = {}
+    data[str(gid)] = priv
+    with open(GAMES_FILE, "w") as f:
+        json.dump(data, f, indent=2)
     return priv
 
-def _load_game_keypair(gid: int) -> Keypair:
-    row = pg_exec("SELECT priv58 FROM game_keys WHERE gid = ?;", (gid,), fetch="one")
-    if not row:
-        raise RuntimeError(f"Missing key for game {gid}")
-    priv58 = row[0]
-    return Keypair.from_bytes(b58decode(priv58))
+def mk_wallet(gid: int) -> Keypair:
+    """
+    Generate a cryptographically random per-game wallet.
+    (Production: DON'T derive keys from predictable data.)
+    """
+    seed = os.urandom(32)
+    return Keypair.from_seed(seed)
 
-def mark_tx_used(tx: str):
-    # persist and cache
-    try:
-        pg_exec("INSERT INTO used_txs (tx) VALUES (?) ON CONFLICT(tx) DO NOTHING;", (tx,))
-        used_txs.add(tx)
-    except Exception as e:
-        logger.warning(f"Failed to persist used tx {tx}: {e}")
-
-def solscan(sig):
-    return f"https://solscan.io/tx/{sig}?cluster=devnet"
+def solscan(sig: str) -> str:
+    # Mainnet default (no cluster query needed)
+    return f"https://solscan.io/tx/{sig}"
 
 def _lamports_from_sol(amt: float | Decimal) -> int:
     return int(Decimal(str(amt)) * Decimal(1_000_000_000))
@@ -287,11 +247,15 @@ def payout(to_addr, amt_sol, *, from_signer: Optional[Keypair] = None) -> str:
     msg = Message([ix], payer=fpk)
     txn = Transaction.new_unsigned(msg)
 
-    blk = solana.get_latest_blockhash(commitment="confirmed").value.blockhash
+    blk = solana.get_latest_blockhash(commitment="finalized").value.blockhash
     txn.sign([kp], blk)
 
     raw = bytes(txn)
-    res = solana.send_raw_transaction(raw, opts=TxOpts(skip_preflight=True))
+    # Production: do NOT skip preflight
+    res = solana.send_raw_transaction(
+        raw,
+        opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed", max_retries=15),
+    )
     return str(res.value)
 
 async def _safe_distribute(recipient_wallet: str, amount: float):
@@ -312,12 +276,13 @@ def distribute_winnings(recipient_wallet: str, amount: float):
     kp = _get_payout_signer()
     paying_from_house = (str(kp.pubkey()) == HOUSE_WALLET)
 
-    # require enough to cover net (+ fee if not retained) + buffer
+    # sanity balance check (best-effort): require enough to cover net (+ fee if not retained) + fee buffer
     needed = _lamports_from_sol(net) + (0 if paying_from_house else _lamports_from_sol(fee)) + FEE_BUFFER_LAMPORTS
-    if _get_signer_balance_lamports(kp) < needed:
-        raise RuntimeError("Insufficient payout balance in payout wallet.")
+    bal = _get_signer_balance_lamports(kp)
+    if bal < needed:
+        raise RuntimeError(f"Insufficient payout balance (have {bal} lamports, need {needed}).")
 
-    # fee transfer/retention
+    # If paying from house, retain the fee (no self-transfer); otherwise send fee to house.
     if paying_from_house:
         fee_sig = "retained"
     else:
@@ -336,8 +301,12 @@ def distribute_winnings(recipient_wallet: str, amount: float):
 
     return win_sig, fee_sig, float(net), float(fee)
 
-# === GAME WALLET SWEEP (unchanged; silent to users) ===
+# === GAME WALLET SWEEP (SAFER) ===
 def _estimate_fee_for_message(msg: Message) -> int:
+    """
+    Best-effort fee estimate for the given Message.
+    Falls back to a conservative buffer if the RPC doesn't support the call.
+    """
     try:
         res = solana.get_fee_for_message(msg)
         fee = getattr(res, "value", None)
@@ -345,9 +314,12 @@ def _estimate_fee_for_message(msg: Message) -> int:
             return fee
         return int(fee or 0)
     except Exception:
-        return 80_000  # conservative fallback
+        return 80_000  # ~0.00008 SOL cushion
 
 def _is_plain_system_account(pubkey: Pubkey) -> bool:
+    """
+    Return True if the account is owned by SystemProgram (no program data).
+    """
     try:
         ai = solana.get_account_info(pubkey).value
         if not ai:
@@ -357,7 +329,21 @@ def _is_plain_system_account(pubkey: Pubkey) -> bool:
     except Exception:
         return True
 
+def _load_game_keypair(gid: int) -> Keypair:
+    try:
+        with open(GAMES_FILE, "r") as f:
+            data = json.load(f)
+        priv58 = data[str(gid)]
+        return Keypair.from_bytes(b58decode(priv58))
+    except Exception as e:
+        raise RuntimeError(f"Missing or unreadable key for game {gid}: {e}")
+
 def sweep_game_wallet_to_house(gid: int) -> Optional[str]:
+    """
+    Transfer a safe amount from the game wallet to HOUSE_WALLET, leaving enough
+    for fees (and a little buffer). Returns the tx signature, or None if nothing to sweep.
+    User-facing messages DO NOT mention sweeping.
+    """
     kp = _load_game_keypair(gid)
     src_pk = kp.pubkey()
     dst_pk = Pubkey.from_string(HOUSE_WALLET)
@@ -372,21 +358,23 @@ def sweep_game_wallet_to_house(gid: int) -> Optional[str]:
         logger.error(f"[sweep] Game #{gid} failed to get balance: {e}")
         return None
 
-    # Keep small buffer for rent/fees
-    SWEEP_KEEP_LAMPORTS = 50_000
     if bal <= SWEEP_KEEP_LAMPORTS:
         return None
 
+    # Build a draft message with placeholder amount (for fee estimation)
     placeholder_lamports = 1
-    data = (2).to_bytes(4, "little") + placeholder_lamports.to_bytes(8, "little")
+    data = (2).to_bytes(4, "little") + placeholder_lamports.to_bytes(8, "little")  # SystemProgram::Transfer
     draft_ix = Instruction(
         program_id=Pubkey.from_string("11111111111111111111111111111111"),
-        accounts=[AccountMeta(src_pk, True, True), AccountMeta(dst_pk, False, True)],
+        accounts=[
+            AccountMeta(src_pk, is_signer=True, is_writable=True),
+            AccountMeta(dst_pk, is_signer=False, is_writable=True),
+        ],
         data=data,
     )
     draft_msg = Message([draft_ix], payer=src_pk)
-    fee_est = _estimate_fee_for_message(draft_msg)
 
+    fee_est = _estimate_fee_for_message(draft_msg)
     keep_min = max(SWEEP_KEEP_LAMPORTS, fee_est + 10_000)
     if bal <= keep_min:
         return None
@@ -398,17 +386,21 @@ def sweep_game_wallet_to_house(gid: int) -> Optional[str]:
     real_data = (2).to_bytes(4, "little") + lamports_to_send.to_bytes(8, "little")
     ix = Instruction(
         program_id=Pubkey.from_string("11111111111111111111111111111111"),
-        accounts=[AccountMeta(src_pk, True, True), AccountMeta(dst_pk, False, True)],
+        accounts=[
+            AccountMeta(src_pk, is_signer=True, is_writable=True),
+            AccountMeta(dst_pk, is_signer=False, is_writable=True),
+        ],
         data=real_data,
     )
 
     msg = Message([ix], payer=src_pk)
     txn = Transaction.new_unsigned(msg)
+
     try:
         blk = solana.get_latest_blockhash(commitment="confirmed").value.blockhash
         txn.sign([kp], blk)
         raw = bytes(txn)
-        res = solana.send_raw_transaction(raw, opts=TxOpts(skip_preflight=False))
+        res = solana.send_raw_transaction(raw, opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed", max_retries=15))
         sig = str(res.value)
         logger.info(f"[sweep] Game #{gid} → HOUSE {HOUSE_WALLET}: {lamports_to_send} lamports ({solscan(sig)})")
         return sig
@@ -434,20 +426,29 @@ def _clear_user_games(gid: int):
             user_games.pop(uid, None)
 
 def _reschedule_timeout(context: ContextTypes.DEFAULT_TYPE, gid: int, seconds: int = INACTIVITY_TIMEOUT_SECS):
+    """Schedule (or reschedule) the inactivity timeout via Application JobQueue."""
     g = games.get(gid)
     if not g:
         return
+
     jq = getattr(context.application, "job_queue", None)
     if jq is None:
         logger.warning("JobQueue not available; timeouts disabled for this run.")
         return
+
     job = g.get("timeout_job")
     if job:
         try:
             job.schedule_removal()
         except Exception:
             pass
-    g["timeout_job"] = jq.run_once(_timeout_cb, when=seconds, data={"gid": gid}, name=f"timeout-{gid}")
+
+    g["timeout_job"] = jq.run_once(
+        _timeout_cb,
+        when=seconds,
+        data={"gid": gid},
+        name=f"timeout-{gid}",
+    )
 
 async def _timeout_cb(ctx: ContextTypes.DEFAULT_TYPE):
     try:
@@ -522,32 +523,52 @@ async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _touch_user(update)
     m = update.effective_message
-    rows = db.top_players(limit=10)
+    with _db_lock:
+        data = _load_db()
+        users = data.get("users", {})
+        rows = []
+        for uid, rec in users.items():
+            s = rec.get("stats", {})
+            played = int(s.get("wins", 0)) + int(s.get("losses", 0)) + int(s.get("draws", 0))
+            if played == 0:
+                continue
+            p = rec.get("profile", {})
+            uname = p.get("username") or f"user{uid}"
+            try:
+                net = Decimal(s.get("net_profit_sol", "0"))
+            except Exception:
+                net = Decimal("0")
+            rows.append({
+                "uid": int(uid),
+                "username": uname,
+                "wins": int(s.get("wins", 0)),
+                "losses": int(s.get("losses", 0)),
+                "draws": int(s.get("draws", 0)),
+                "net": net,
+            })
     if not rows:
         return await m.reply_text("No stats yet. Play a game with /play!")
 
+    rows.sort(key=lambda r: (r["net"], r["wins"]), reverse=True)
+    top = rows[:10]
     lines = ["🏆 Leaderboard (by net profit in SOL):"]
-    for i, (uid, uname, wins, losses, draws, net) in enumerate(rows, 1):
-        lines.append(f"{i}. @{uname} — net {net} | W:{wins} L:{losses} D:{draws}")
+    for i, r in enumerate(top, 1):
+        lines.append(f"{i}. @{r['username']} — net {r['net']} | W:{r['wins']} L:{r['losses']} D:{r['draws']}")
     await m.reply_text("\n".join(lines))
 
 async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _touch_user(update)
     if not _is_owner(update.effective_user.id):
         return await update.effective_message.reply_text("🚫")
-    rows = pg_exec("""
-        SELECT u.user_id,
-               COALESCE(NULLIF(u.username,''), 'user' || CAST(u.user_id AS TEXT)) AS uname,
-               s.wins, s.losses, s.draws, s.net_profit_sol
-        FROM users u
-        LEFT JOIN user_stats s ON s.user_id = u.user_id
-        ORDER BY u.user_id DESC
-        LIMIT 50;
-    """, fetch="all") or []
-    total = pg_exec('SELECT COUNT(*) FROM users;', fetch='one')[0]
-    lines = [f"Total users: {total}"]
-    for uid, uname, w, l, d, net in rows:
-        lines.append(f"• {uid} @{uname} W:{w or 0} L:{l or 0} D:{d or 0} net:{net or 0}")
+    with _db_lock:
+        data = _load_db()
+        users = data.get("users", {})
+        lines = [f"Total users: {len(users)}"]
+        for uid, rec in list(users.items())[:50]:
+            p = rec.get("profile", {})
+            s = rec.get("stats", {})
+            uname = p.get("username") or f"user{uid}"
+            lines.append(f"• {uid} @{uname} W:{s.get('wins',0)} L:{s.get('losses',0)} D:{s.get('draws',0)} net:{s.get('net_profit_sol','0')}")
     await update.effective_message.reply_text("\n".join(lines))
 
 # === GAME COMMANDS ===
@@ -559,7 +580,7 @@ async def play(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     chat = update.effective_chat
     cid = chat.id
-    chat_type = getattr(chat, "type", None) or "private"  # 'private'|'group'|'supergroup'|'channel'
+    chat_type = getattr(chat, "type", None) or "private"
 
     if uid in user_games:
         return await m.reply_text("⚠️ Finish your active game with /cancel first.")
@@ -588,13 +609,12 @@ async def play(update: Update, context: ContextTypes.DEFAULT_TYPE):
     addr = str(kp.pubkey())
     store_key(gid, kp)
 
-    # per-game settings
     if gtype == "basketball":
-        max_tries = 3         # best-of-3
+        max_tries = 3
     elif gtype == "darts":
-        max_tries = 3         # three throws each to hit a bullseye
-    else:  # dice
-        max_tries = None      # unlimited until someone rolls 6
+        max_tries = 3
+    else:
+        max_tries = None
 
     games[gid] = {
         "creator": uid,
@@ -605,12 +625,12 @@ async def play(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "wallet": addr,
         "chat_id": cid,
         "chat_type": chat_type,
-        "players": {},      # uid->{username,wallet}
-        "tries": {},        # uid->remaining (None for dice)
-        "scores": {},       # uid->score (basketball only)
-        "rolls": {},        # darts legacy (not used in new rules)
+        "players": {},
+        "tries": {},
+        "scores": {},
+        "rolls": {},
         "max": max_tries,
-        "state": "waiting",  # waiting→playing→ended
+        "state": "waiting",
         "order": [],
         "cur": 0,
         "winner": None,
@@ -630,11 +650,6 @@ async def play(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"ℹ️ Payouts will go back to your funding wallet.",
         parse_mode="HTML"
     )
-
-def mk_wallet(gid):
-    seed = f"mojibet-game-{gid}".encode()
-    h = sha256(seed).digest()[:32]
-    return Keypair.from_seed(h)
 
 async def join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _touch_user(update)
@@ -656,6 +671,10 @@ async def join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     g = games[gid]
     uid = update.effective_user.id
     chat_id = update.effective_chat.id
+
+    # Prevent a user from being in multiple concurrent games
+    if uid in user_games and user_games[uid] != gid:
+        return await m.reply_text("⚠️ Finish your other active game with /cancel first.")
 
     # Enforce: must join in the same chat ONLY for group-origin games.
     origin_type = g.get("chat_type", "private")
@@ -682,9 +701,15 @@ async def join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if tx in used_txs or tx in g["accepted_txs"]:
             return await m.reply_text("🚫 This transaction has already been used. Provide a fresh payment.")
 
+        # Guard: don't allow joining if already full or started
+        if g["state"] != "waiting":
+            return await m.reply_text("❌ Game already started.")
+        if len(g["players"]) >= g["num"]:
+            return await m.reply_text("❌ Game is already full.")
+
         # Fetch tx
         try:
-            res = solana.get_transaction(sig, encoding="jsonParsed")
+            res = solana.get_transaction(sig, encoding="jsonParsed", commitment="confirmed")
         except Exception as e:
             logger.warning(f"RPC error fetching tx {tx}: {e}")
             return await m.reply_text("❌ Could not verify the transaction (RPC error). Please try again shortly.")
@@ -699,12 +724,16 @@ async def join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if hasattr(res.value, "meta") and getattr(res.value.meta, "err", None):
                 return await m.reply_text("❌ Transaction failed on-chain (meta error).")
 
+            # Walk parsed instructions and find a transfer to the game wallet with sufficient lamports
+            min_lamports = _lamports_from_sol(g["amt"])
             for ix in res.value.transaction.transaction.message.instructions:
                 if hasattr(ix, "parsed"):
                     p, info = ix.parsed, ix.parsed.get("info", {})
-                    if (p.get("type") == "transfer"
+                    if (
+                        p.get("type") == "transfer"
                         and info.get("destination") == g["wallet"]
-                        and int(info.get("lamports", 0)) >= int(g["amt"] * 1e9)):
+                        and int(info.get("lamports", 0)) >= min_lamports
+                    ):
                         ok, src = True, info.get("source")
                         break
         except Exception as e:
@@ -714,28 +743,32 @@ async def join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not ok:
             return await m.reply_text("❌ TX does not match this game’s deposit (wrong destination or amount).")
 
-        # Prevent same funding wallet twice
+        # Prevent same funding wallet twice in this game
         if src in g["source_wallets"]:
             return await m.reply_text("🚫 That funding wallet has already been used to join this game.")
 
         # Mark as used (atomic under the lock)
         g["accepted_txs"].add(tx)
         g["source_wallets"].add(src)
-        mark_tx_used(tx)
+        used_txs.add(tx)
+        _persist_used_txs()
+
+        # Last guard before registering: capacity check (avoid overfill under concurrent joins)
+        if len(g["players"]) >= g["num"]:
+            return await m.reply_text("❌ Game just filled up.")
 
         # Register player
         g["players"][uid] = {
             "username": update.effective_user.username or f"user{uid}",
             "wallet": src
         }
-
         if g["type"] == "basketball":
             g["tries"][uid] = g["max"]
             g["scores"][uid] = 0
         elif g["type"] == "darts":
             g["tries"][uid] = g["max"]
             g["rolls"][uid] = None
-        else:  # dice
+        else:
             g["tries"][uid] = None
 
         user_games[uid] = gid
@@ -801,7 +834,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _finish_with_draw_and_refund(context, gid, "cancelled by creator")
         return
 
-    # Otherwise just remove
     user_games.pop(uid, None)
     if g.get("timeout_job"):
         try:
@@ -826,6 +858,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === GAME PLAY ===
 def _advance_to_next_playable(g):
+    start = g["cur"]
     n = len(g["order"])
     for _ in range(n):
         g["cur"] = (g["cur"] + 1) % n
@@ -839,7 +872,6 @@ async def _finish_with_winner(context, gid, winner_uid):
     if not g:
         return
 
-    # Sweep silently
     try:
         await _sweep_game_wallet_to_house_async(gid)
     except Exception as e:
@@ -856,7 +888,6 @@ async def _finish_with_winner(context, gid, winner_uid):
         logger.error(f"Payout failed for Game #{gid}: {e}")
         prize_line = f"⚠️ Payout could not be sent automatically. Support will contact you.\nReason: {e}"
 
-    # Update stats
     try:
         for pu in g["players"].keys():
             if pu == winner_uid:
@@ -874,9 +905,15 @@ async def _finish_with_winner(context, gid, winner_uid):
 
     for pu, pdata in g["players"].items():
         if pu == winner_uid:
-            await safe_send(context.bot, pu, f"✅ You WON Game #{gid}!\n{prize_line}")
+            await safe_send(
+                context.bot, pu,
+                f"✅ You WON Game #{gid}!\n{prize_line}"
+            )
         else:
-            await safe_send(context.bot, pu, f"❌ You lost Game #{gid}.\nWinner: @{uname}\n{prize_line}")
+            await safe_send(
+                context.bot, pu,
+                f"❌ You lost Game #{gid}.\nWinner: @{uname}\n{prize_line}"
+            )
 
     g["state"] = "ended"
     if g.get("timeout_job"):
@@ -905,7 +942,10 @@ async def _finish_with_draw_and_refund(context, gid, reason: str):
         try:
             win_sig, fee_sig, net_amount, fee = await _safe_distribute(pdata["wallet"], ref)
             lines.append(f"@{pdata['username']} → {net_amount} SOL ({pdata['wallet']})")
-            await safe_send(context.bot, pu, f"🔄 Game #{gid} draw/refund sent to your wallet.\n{solscan(win_sig)}")
+            await safe_send(
+                context.bot, pu,
+                f"🔄 Game #{gid} draw/refund sent to your wallet.\n{solscan(win_sig)}"
+            )
             db.update_stats(pu, delta_draw=1, delta_profit_sol=Decimal("0"))
         except Exception as e:
             logger.error(f"Refund payout failed for Game #{gid}, user {pu}: {e}")
@@ -925,7 +965,6 @@ async def _finish_with_draw_and_refund(context, gid, reason: str):
     game_locks.pop(gid, None)
 
 async def _prompt_next_turn(context, g, gid, text_for_group: str, player_uid: int, emoji: str, action_word: str):
-    """Monospaced emoji for all types to ensure tappable surface."""
     mono = f"`{emoji}`"
     tg = text_for_group.replace(f" {emoji} ", f" {mono} ").replace(f" {emoji}", f" {mono}")
     await safe_send(context.bot, g["chat_id"], tg, parse_mode="Markdown")
@@ -947,7 +986,7 @@ async def on_roll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt = (msg.text or "").strip()
         if txt in EMOJI_MAP.values():
             emoji = txt
-            val = random.randint(1, 6)
+            val = random.randint(1, 6)  # fallback
         else:
             return
 
@@ -967,7 +1006,7 @@ async def on_roll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gtype = g["type"]
 
     if gtype == "basketball":
-        scored = (val in (4, 5))  # Telegram 🏀 hoop when 4 or 5
+        scored = (val in (4, 5))
         if scored:
             g["scores"][uid] += 1
         g["tries"][uid] -= 1
@@ -1043,9 +1082,9 @@ async def cq(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _any_update_logger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user:
         await _touch_user(update)
-    # no reply; keep it transparent
+    # no reply
 
-# === Commands list ===
+# === Commands list (wallet commands removed) ===
 async def _set_my_commands(app):
     cmds = [
         ("start", "Start"),
@@ -1061,8 +1100,8 @@ async def _set_my_commands(app):
 
 # === BOOT ===
 def main():
-    # Init DB and cache
-    init_db()
+    global used_txs
+    used_txs = _load_used_txs()
 
     async def _post_init(app_):
         await _set_my_commands(app_)
@@ -1099,7 +1138,7 @@ def main():
     app.add_handler(MessageHandler(filters.Dice() | filters.Regex(r'^[🏀🎯🎲]$'), on_roll))
     app.add_handler(CallbackQueryHandler(cq))
 
-    logger.info('🚀 MojiBet bot started (SQLite)')
+    logger.info('🚀 MojiBet bot started (MAINNET)')
     app.run_polling()
 
 if __name__ == "__main__":
