@@ -83,8 +83,10 @@ if HOUSE_PRIVATE_KEY:
 
 HOUSE_FEE_RATE = Decimal("0.05")          # 5% house fee (user-facing text never shows this)
 INACTIVITY_TIMEOUT_SECS = 5 * 60          # 5 minutes
-SWEEP_KEEP_LAMPORTS = 50_000              # ~0.00005 SOL safety buffer
-FEE_BUFFER_LAMPORTS = 100_000             # extra fee cushion for payouts (~0.0001 SOL)
+
+# Buffers (raised to avoid sweep/payout preflight issues)
+SWEEP_KEEP_LAMPORTS = 500_000             # ~0.0005 SOL kept in game wallet after sweep
+FEE_BUFFER_LAMPORTS = 200_000             # extra fee cushion for payouts (~0.0002 SOL)
 
 GAMES_FILE = "game_keys.json"
 USED_TX_FILE = "used_txs.json"
@@ -301,6 +303,11 @@ def distribute_winnings(recipient_wallet: str, amount: float):
 
     return win_sig, fee_sig, float(net), float(fee)
 
+def _payout_signer_can_cover(prize_sol: float) -> bool:
+    lam_needed = _lamports_from_sol(prize_sol) + FEE_BUFFER_LAMPORTS
+    bal = _get_signer_balance_lamports()
+    return bal >= lam_needed
+
 # === GAME WALLET SWEEP (SAFER) ===
 def _estimate_fee_for_message(msg: Message) -> int:
     """
@@ -311,10 +318,10 @@ def _estimate_fee_for_message(msg: Message) -> int:
         res = solana.get_fee_for_message(msg)
         fee = getattr(res, "value", None)
         if isinstance(fee, int):
-            return fee
-        return int(fee or 0)
+            return max(fee, 5_000)  # never assume zero
+        return 10_000
     except Exception:
-        return 80_000  # ~0.00008 SOL cushion
+        return 10_000  # ~0.00001 SOL cushion
 
 def _is_plain_system_account(pubkey: Pubkey) -> bool:
     """
@@ -375,12 +382,14 @@ def sweep_game_wallet_to_house(gid: int) -> Optional[str]:
     draft_msg = Message([draft_ix], payer=src_pk)
 
     fee_est = _estimate_fee_for_message(draft_msg)
-    keep_min = max(SWEEP_KEEP_LAMPORTS, fee_est + 10_000)
+
+    # Leave at least the fee estimate + cushion, but never less than SWEEP_KEEP_LAMPORTS
+    keep_min = max(SWEEP_KEEP_LAMPORTS, fee_est + 20_000)
     if bal <= keep_min:
         return None
 
     lamports_to_send = bal - keep_min
-    if lamports_to_send < 5_000:
+    if lamports_to_send < 20_000:
         return None
 
     real_data = (2).to_bytes(4, "little") + lamports_to_send.to_bytes(8, "little")
@@ -571,6 +580,19 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"• {uid} @{uname} W:{s.get('wins',0)} L:{s.get('losses',0)} D:{s.get('draws',0)} net:{s.get('net_profit_sol','0')}")
     await update.effective_message.reply_text("\n".join(lines))
 
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: show payout signer and current SOL balance."""
+    await _touch_user(update)
+    if not _is_owner(update.effective_user.id):
+        return await update.effective_message.reply_text("🚫")
+    kp = _get_payout_signer()
+    lam = _get_signer_balance_lamports(kp)
+    await update.effective_message.reply_text(
+        f"Payout signer: {str(kp.pubkey())}\n"
+        f"Balance: {lam} lamports (~{lam/1_000_000_000:.6f} SOL)\n"
+        f"HOUSE_WALLET: {HOUSE_WALLET}"
+    )
+
 # === GAME COMMANDS ===
 async def play(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _touch_user(update)
@@ -601,6 +623,13 @@ async def play(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await m.reply_text("⚠️ Amount must be greater than 0.")
     except Exception:
         return await m.reply_text("⚠️ [players]=int, [amount]=float")
+
+    # Guard: do not allow starting a game if payout signer cannot cover worst-case prize
+    prize = num * amt
+    if not _payout_signer_can_cover(prize):
+        return await m.reply_text(
+            "⚠️ Game unavailable right now. Please try a smaller amount or try again later."
+        )
 
     gid = random.randint(1000, 9999)
     while gid in games:
@@ -1095,6 +1124,7 @@ async def _set_my_commands(app):
         ("cancel", "Cancel your game"),
         ("leaderboard", "Top players"),
         ("support", "DM support"),
+        ("balance", "Admin: payout balance"),
     ]
     await app.bot.set_my_commands([BotCommand(k, v) for k, v in cmds])
 
@@ -1133,6 +1163,7 @@ def main():
     # Leaderboard/Admin
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("users", users_cmd))
+    app.add_handler(CommandHandler("balance", balance))
 
     # Game interactions
     app.add_handler(MessageHandler(filters.Dice() | filters.Regex(r'^[🏀🎯🎲]$'), on_roll))
