@@ -1,4 +1,4 @@
-import os
+import os 
 import random
 import json
 import logging
@@ -48,14 +48,13 @@ logger = logging.getLogger(__name__)
 # === ENV & CONSTANTS ===
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-# MAINNET by default; you may override with your provider (Jito, Helius, Triton, QuickNode, etc.)
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
 
 BOT_PRIVATE_KEY = os.getenv("BOT_PRIVATE_KEY")
 HOUSE_WALLET = os.getenv("HOUSE_WALLET")
-HOUSE_PRIVATE_KEY = os.getenv("HOUSE_PRIVATE_KEY")  # OPTIONAL: payouts/refunds from house
+HOUSE_PRIVATE_KEY = os.getenv("HOUSE_PRIVATE_KEY")
 
-SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "YourSupportHandle")  # no '@'
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "YourSupportHandle")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 if not BOT_TOKEN:
@@ -65,11 +64,10 @@ if not BOT_PRIVATE_KEY:
 if not HOUSE_WALLET:
     raise RuntimeError("Missing HOUSE_WALLET (Solana address)")
 
-# Validate keys early (fail fast)
 try:
     _tmp_signer = Keypair.from_bytes(b58decode(BOT_PRIVATE_KEY))
 except Exception:
-    raise RuntimeError("BOT_PRIVATE_KEY must be base58 of the raw secret key bytes (usually 64 bytes).")
+    raise RuntimeError("BOT_PRIVATE_KEY must be base58 of the raw secret key bytes (64 bytes).")
 try:
     _ = Pubkey.from_string(HOUSE_WALLET)
 except Exception:
@@ -78,25 +76,20 @@ if HOUSE_PRIVATE_KEY:
     try:
         _ = Keypair.from_bytes(b58decode(HOUSE_PRIVATE_KEY))
     except Exception:
-        raise RuntimeError("HOUSE_PRIVATE_KEY (if set) must be base58 of the raw secret key bytes.")
+        raise RuntimeError("HOUSE_PRIVATE_KEY must be base58 of the raw secret key bytes.")
 
-HOUSE_FEE_RATE = Decimal("0.05")          # 5% house fee (user-facing text never shows this)
-INACTIVITY_TIMEOUT_SECS = 5 * 60          # 5 minutes
-
-# Buffers (raised to avoid sweep/payout preflight issues)
-SWEEP_KEEP_LAMPORTS = 500_000             # ~0.0005 SOL kept in game wallet after sweep
-FEE_BUFFER_LAMPORTS = 200_000             # extra fee cushion for payouts (~0.0002 SOL)
+HOUSE_FEE_RATE = Decimal("0.05")
+INACTIVITY_TIMEOUT_SECS = 5 * 60
+FEE_BUFFER_LAMPORTS = 200_000
 
 GAMES_FILE = "game_keys.json"
 USED_TX_FILE = "used_txs.json"
 FAILED_PAYOUTS_FILE = "failed_payouts.json"
 
-games = {}        # gid -> game data (in-memory)
-user_games = {}   # uid -> gid (limit a user to 1 concurrent game)
-used_txs = set()  # globally accepted tx signatures
-game_locks = {}   # gid -> asyncio.Lock()
-
-# serialize payouts to avoid double-spends/nonce issues under load
+games = {}
+user_games = {}
+used_txs = set()
+game_locks = {}
 _payout_lock = asyncio.Lock()
 
 EMOJI_MAP = {
@@ -111,10 +104,9 @@ signer = Keypair.from_bytes(b58decode(BOT_PRIVATE_KEY))
 house_signer = Keypair.from_bytes(b58decode(HOUSE_PRIVATE_KEY)) if HOUSE_PRIVATE_KEY else None
 
 def _get_payout_signer() -> Keypair:
-    """Prefer house wallet for payouts/refunds if provided; otherwise use bot signer."""
     return house_signer or signer
 
-# === DATABASE (JSON-backed; stats & profile only) ===
+# === DATABASE ===
 DB_FILE = Path("db.json")
 _db_lock = threading.Lock()
 
@@ -155,7 +147,6 @@ class DB:
             u = _ensure_user(data, user_id)
             return u
 
-    # stats & profile only
     def update_stats(self, user_id: int, *, delta_win=0, delta_loss=0, delta_draw=0, delta_profit_sol=Decimal("0")):
         with _db_lock:
             data = _load_db()
@@ -166,7 +157,6 @@ class DB:
             s["draws"] = int(s.get("draws", 0)) + delta_draw
             cur = Decimal(s.get("net_profit_sol", "0"))
             s["net_profit_sol"] = str((cur + delta_profit_sol).normalize())
-            # epoch timestamp (not monotonic)
             s["last_played_ts"] = int(time.time())
             _save_db(data)
 
@@ -193,7 +183,6 @@ def _persist_used_txs():
         logger.warning(f"Failed to persist used txs: {e}")
 
 def _store_failed_payout(game_id: int, recipient: str, amount: float, reason: str):
-    """Append a failed payout record for later retries."""
     try:
         try:
             data = json.load(open(FAILED_PAYOUTS_FILE))
@@ -222,15 +211,10 @@ def store_key(gid, kp):
     return priv
 
 def mk_wallet(gid: int) -> Keypair:
-    """
-    Generate a cryptographically random per-game wallet.
-    (Production: DON'T derive keys from predictable data.)
-    """
     seed = os.urandom(32)
     return Keypair.from_seed(seed)
 
 def solscan(sig: str) -> str:
-    # Mainnet default (no cluster query needed)
     return f"https://solscan.io/tx/{sig}"
 
 def _lamports_from_sol(amt: float | Decimal) -> int:
@@ -246,13 +230,11 @@ def _get_signer_balance_lamports(kp: Optional[Keypair] = None) -> int:
 
 # === PAYOUTS ===
 def payout(to_addr, amt_sol, *, from_signer: Optional[Keypair] = None) -> str:
-    """Send a SystemProgram transfer from 'from_signer' (or payout signer) to 'to_addr'."""
     kp = from_signer or _get_payout_signer()
     lam = _lamports_from_sol(amt_sol)
     fpk = kp.pubkey()
     tpk = Pubkey.from_string(to_addr)
 
-    # SystemProgram::Transfer discriminator index 2 (u32 LE) + lamports (u64 LE)
     data = (2).to_bytes(4, "little") + lam.to_bytes(8, "little")
 
     ix = Instruction(
@@ -271,7 +253,6 @@ def payout(to_addr, amt_sol, *, from_signer: Optional[Keypair] = None) -> str:
     txn.sign([kp], blk)
 
     raw = bytes(txn)
-    # Production: do NOT skip preflight
     res = solana.send_raw_transaction(
         raw,
         opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed", max_retries=15),
@@ -279,30 +260,22 @@ def payout(to_addr, amt_sol, *, from_signer: Optional[Keypair] = None) -> str:
     return str(res.value)
 
 async def _safe_distribute(recipient_wallet: str, amount: float):
-    # serialize payouts; run blocking call in thread
     async with _payout_lock:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, lambda: distribute_winnings(recipient_wallet, amount))
 
 def distribute_winnings(recipient_wallet: str, amount: float):
-    """
-    Sends the house fee to HOUSE_WALLET (unless payout signer IS the house, then it's retained),
-    and sends net winnings/refund to recipient_wallet.
-    USER-FACING MESSAGES MUST NOT MENTION FEES; FEES ARE LOGGED ONLY.
-    """
     fee = (Decimal(str(amount)) * HOUSE_FEE_RATE).quantize(Decimal("0.00000001"))
     net = (Decimal(str(amount)) - fee).quantize(Decimal("0.00000001"))
 
     kp = _get_payout_signer()
     paying_from_house = (str(kp.pubkey()) == HOUSE_WALLET)
 
-    # sanity balance check (best-effort): require enough to cover net (+ fee if not retained) + fee buffer
     needed = _lamports_from_sol(net) + (0 if paying_from_house else _lamports_from_sol(fee)) + FEE_BUFFER_LAMPORTS
     bal = _get_signer_balance_lamports(kp)
     if bal < needed:
         raise RuntimeError(f"Insufficient payout balance (have {bal} lamports, need {needed}).")
 
-    # If paying from house, retain the fee (no self-transfer); otherwise send fee to house.
     if paying_from_house:
         fee_sig = "retained"
     else:
@@ -310,7 +283,6 @@ def distribute_winnings(recipient_wallet: str, amount: float):
 
     win_sig = payout(recipient_wallet, float(net), from_signer=kp)
 
-    # LOG fees (not shown to users)
     logger.info(f"[payout] gross={amount} net={net} fee={fee} fee_sig={fee_sig} to={recipient_wallet} win_sig={win_sig}")
 
     logger.info(f"[+] Paid {net} to winner/refund: {recipient_wallet} ({win_sig})")
@@ -321,25 +293,18 @@ def distribute_winnings(recipient_wallet: str, amount: float):
 
     return win_sig, fee_sig, float(net), float(fee)
 
-# === GAME WALLET SWEEP (SAFER) ===
+# === GAME WALLET SWEEP (DYNAMIC RENT FIX) ===
 def _estimate_fee_for_message(msg: Message) -> int:
-    """
-    Best-effort fee estimate for the given Message.
-    Falls back to a conservative buffer if the RPC doesn't support the call.
-    """
     try:
         res = solana.get_fee_for_message(msg)
         fee = getattr(res, "value", None)
         if isinstance(fee, int):
-            return max(fee, 5_000)  # never assume zero
+            return max(fee, 5_000)
         return 10_000
     except Exception:
-        return 10_000  # ~0.00001 SOL cushion
+        return 10_000
 
 def _is_plain_system_account(pubkey: Pubkey) -> bool:
-    """
-    Return True if the account is owned by SystemProgram (no program data).
-    """
     try:
         ai = solana.get_account_info(pubkey).value
         if not ai:
@@ -358,12 +323,13 @@ def _load_game_keypair(gid: int) -> Keypair:
     except Exception as e:
         raise RuntimeError(f"Missing or unreadable key for game {gid}: {e}")
 
+def _get_rent_exempt_minimum() -> int:
+    try:
+        return solana.get_minimum_balance_for_rent_exemption(0).value
+    except Exception:
+        return 2_500_000  # fallback
+
 def sweep_game_wallet_to_house(gid: int) -> Optional[str]:
-    """
-    Transfer a safe amount from the game wallet to HOUSE_WALLET, leaving enough
-    for fees (and a little buffer). Returns the tx signature, or None if nothing to sweep.
-    User-facing messages DO NOT mention sweeping.
-    """
     kp = _load_game_keypair(gid)
     src_pk = kp.pubkey()
     dst_pk = Pubkey.from_string(HOUSE_WALLET)
@@ -378,12 +344,11 @@ def sweep_game_wallet_to_house(gid: int) -> Optional[str]:
         logger.error(f"[sweep] Game #{gid} failed to get balance: {e}")
         return None
 
-    if bal <= SWEEP_KEEP_LAMPORTS:
+    if bal <= 0:
         return None
 
-    # Build a draft message with placeholder amount (for fee estimation)
     placeholder_lamports = 1
-    data = (2).to_bytes(4, "little") + placeholder_lamports.to_bytes(8, "little")  # SystemProgram::Transfer
+    data = (2).to_bytes(4, "little") + placeholder_lamports.to_bytes(8, "little")
     draft_ix = Instruction(
         program_id=Pubkey.from_string("11111111111111111111111111111111"),
         accounts=[
@@ -395,9 +360,9 @@ def sweep_game_wallet_to_house(gid: int) -> Optional[str]:
     draft_msg = Message([draft_ix], payer=src_pk)
 
     fee_est = _estimate_fee_for_message(draft_msg)
+    rent_min = _get_rent_exempt_minimum()
 
-    # Leave at least the fee estimate + cushion, but never less than SWEEP_KEEP_LAMPORTS
-    keep_min = max(SWEEP_KEEP_LAMPORTS, fee_est + 20_000)
+    keep_min = max(rent_min, fee_est + 20_000)
     if bal <= keep_min:
         return None
 
@@ -422,7 +387,10 @@ def sweep_game_wallet_to_house(gid: int) -> Optional[str]:
         blk = solana.get_latest_blockhash(commitment="confirmed").value.blockhash
         txn.sign([kp], blk)
         raw = bytes(txn)
-        res = solana.send_raw_transaction(raw, opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed", max_retries=15))
+        res = solana.send_raw_transaction(
+            raw, 
+            opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed", max_retries=15)
+        )
         sig = str(res.value)
         logger.info(f"[sweep] Game #{gid} → HOUSE {HOUSE_WALLET}: {lamports_to_send} lamports ({solscan(sig)})")
         return sig
