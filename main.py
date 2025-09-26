@@ -4,7 +4,6 @@ import json
 import logging
 import time
 from decimal import Decimal
-from hashlib import sha256  # (still used elsewhere, not for keygen)
 from base58 import b58encode, b58decode
 from dotenv import load_dotenv
 
@@ -90,6 +89,7 @@ FEE_BUFFER_LAMPORTS = 200_000             # extra fee cushion for payouts (~0.00
 
 GAMES_FILE = "game_keys.json"
 USED_TX_FILE = "used_txs.json"
+FAILED_PAYOUTS_FILE = "failed_payouts.json"
 
 games = {}        # gid -> game data (in-memory)
 user_games = {}   # uid -> gid (limit a user to 1 concurrent game)
@@ -191,6 +191,24 @@ def _persist_used_txs():
         json.dump(sorted(list(used_txs)), open(USED_TX_FILE, "w"), indent=2)
     except Exception as e:
         logger.warning(f"Failed to persist used txs: {e}")
+
+def _store_failed_payout(game_id: int, recipient: str, amount: float, reason: str):
+    """Append a failed payout record for later retries."""
+    try:
+        try:
+            data = json.load(open(FAILED_PAYOUTS_FILE))
+        except Exception:
+            data = []
+        data.append({
+            "game_id": game_id,
+            "recipient": recipient,
+            "amount": amount,
+            "reason": reason,
+            "ts": int(time.time())
+        })
+        json.dump(data, open(FAILED_PAYOUTS_FILE, "w"), indent=2)
+    except Exception as e:
+        logger.error(f"Failed to persist failed payout: {e}")
 
 def store_key(gid, kp):
     priv = b58encode(bytes(kp)).decode()
@@ -302,11 +320,6 @@ def distribute_winnings(recipient_wallet: str, amount: float):
         logger.info(f"[+] Fee {fee} sent to house wallet: {HOUSE_WALLET} ({fee_sig})")
 
     return win_sig, fee_sig, float(net), float(fee)
-
-def _payout_signer_can_cover(prize_sol: float) -> bool:
-    lam_needed = _lamports_from_sol(prize_sol) + FEE_BUFFER_LAMPORTS
-    bal = _get_signer_balance_lamports()
-    return bal >= lam_needed
 
 # === GAME WALLET SWEEP (SAFER) ===
 def _estimate_fee_for_message(msg: Message) -> int:
@@ -624,12 +637,7 @@ async def play(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         return await m.reply_text("⚠️ [players]=int, [amount]=float")
 
-    # Guard: do not allow starting a game if payout signer cannot cover worst-case prize
-    prize = num * amt
-    if not _payout_signer_can_cover(prize):
-        return await m.reply_text(
-            "⚠️ Game unavailable right now. Please try a smaller amount or try again later."
-        )
+    # REMOVED: payout signer pre-check so games can start regardless of signer balance
 
     gid = random.randint(1000, 9999)
     while gid in games:
@@ -915,6 +923,7 @@ async def _finish_with_winner(context, gid, winner_uid):
         prize_line = f"Prize paid: {net_amount} SOL → {wall}\n{solscan(win_sig)}"
     except Exception as e:
         logger.error(f"Payout failed for Game #{gid}: {e}")
+        _store_failed_payout(gid, wall, prize, str(e))
         prize_line = f"⚠️ Payout could not be sent automatically. Support will contact you.\nReason: {e}"
 
     try:
@@ -978,6 +987,7 @@ async def _finish_with_draw_and_refund(context, gid, reason: str):
             db.update_stats(pu, delta_draw=1, delta_profit_sol=Decimal("0"))
         except Exception as e:
             logger.error(f"Refund payout failed for Game #{gid}, user {pu}: {e}")
+            _store_failed_payout(gid, pdata["wallet"], ref, str(e))
             lines.append(f"@{pdata['username']} → refund pending (payout error).")
 
     lines.append("\n➕ Start a new one with /play")
@@ -1128,6 +1138,29 @@ async def _set_my_commands(app):
     ]
     await app.bot.set_my_commands([BotCommand(k, v) for k, v in cmds])
 
+# === FAILED PAYOUTS RETRY (runs every hour) ===
+async def retry_failed_payouts(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        data = json.load(open(FAILED_PAYOUTS_FILE))
+    except Exception:
+        return
+    if not data:
+        return
+    logger.info(f"[retry] Attempting {len(data)} failed payouts...")
+    still_failed = []
+    for rec in data:
+        recipient = rec.get("recipient")
+        amount = rec.get("amount")
+        try:
+            sig = payout(recipient, amount)
+            logger.info(f"[retry] ✅ Retried payout {amount} SOL → {recipient} ({sig})")
+        except Exception as e:
+            logger.error(f"[retry] ❌ Retry failed for {recipient}: {e}")
+            rec["reason"] = str(e)
+            rec["ts"] = int(time.time())
+            still_failed.append(rec)
+    json.dump(still_failed, open(FAILED_PAYOUTS_FILE, "w"), indent=2)
+
 # === BOOT ===
 def main():
     global used_txs
@@ -1145,6 +1178,10 @@ def main():
 
     if getattr(app, "job_queue", None) is None:
         logger.warning("JobQueue is None; timeouts/cancel-on-inactivity will not run.")
+    else:
+        # Auto-retry failed payouts every hour (starts after 60s)
+        app.job_queue.run_repeating(retry_failed_payouts, interval=3600, first=60)
+        logger.info("⏳ Failed payout retry scheduled every 1h")
 
     # Passive logger (early group to not steal updates)
     app.add_handler(MessageHandler(filters.ALL, _any_update_logger), group=-1)
