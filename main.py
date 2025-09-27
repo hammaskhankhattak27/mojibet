@@ -1,4 +1,4 @@
-import os 
+import os  
 import random
 import json
 import logging
@@ -105,6 +105,21 @@ house_signer = Keypair.from_bytes(b58decode(HOUSE_PRIVATE_KEY)) if HOUSE_PRIVATE
 
 def _get_payout_signer() -> Keypair:
     return house_signer or signer
+
+# === RETRY WRAPPER ===
+def rpc_call_with_retry(fn, *args, retries=5, **kwargs):
+    """Retry Solana RPC calls with exponential backoff on 429/connection errors."""
+    for i in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            msg = str(e)
+            if ("429" in msg or "Too Many Requests" in msg or "HTTP error" in msg) and i < retries - 1:
+                wait = 2 ** i + random.random()
+                logger.warning(f"[rpc] Retry {i+1}/{retries} after error: {msg} (waiting {wait:.1f}s)")
+                time.sleep(wait)
+                continue
+            raise
 
 # === DATABASE ===
 DB_FILE = Path("db.json")
@@ -223,7 +238,7 @@ def _lamports_from_sol(amt: float | Decimal) -> int:
 def _get_signer_balance_lamports(kp: Optional[Keypair] = None) -> int:
     kp = kp or _get_payout_signer()
     try:
-        resp = solana.get_balance(kp.pubkey())
+        resp = rpc_call_with_retry(solana.get_balance, kp.pubkey())
         return int(resp.value)
     except Exception:
         return 0
@@ -249,11 +264,12 @@ def payout(to_addr, amt_sol, *, from_signer: Optional[Keypair] = None) -> str:
     msg = Message([ix], payer=fpk)
     txn = Transaction.new_unsigned(msg)
 
-    blk = solana.get_latest_blockhash(commitment="finalized").value.blockhash
+    blk = rpc_call_with_retry(solana.get_latest_blockhash, commitment="finalized").value.blockhash
     txn.sign([kp], blk)
 
     raw = bytes(txn)
-    res = solana.send_raw_transaction(
+    res = rpc_call_with_retry(
+        solana.send_raw_transaction,
         raw,
         opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed", max_retries=15),
     )
@@ -296,7 +312,7 @@ def distribute_winnings(recipient_wallet: str, amount: float):
 # === GAME WALLET SWEEP (DYNAMIC RENT FIX) ===
 def _estimate_fee_for_message(msg: Message) -> int:
     try:
-        res = solana.get_fee_for_message(msg)
+        res = rpc_call_with_retry(solana.get_fee_for_message, msg)
         fee = getattr(res, "value", None)
         if isinstance(fee, int):
             return max(fee, 5_000)
@@ -306,7 +322,7 @@ def _estimate_fee_for_message(msg: Message) -> int:
 
 def _is_plain_system_account(pubkey: Pubkey) -> bool:
     try:
-        ai = solana.get_account_info(pubkey).value
+        ai = rpc_call_with_retry(solana.get_account_info, pubkey).value
         if not ai:
             return True
         owner = str(ai.owner)
@@ -325,7 +341,7 @@ def _load_game_keypair(gid: int) -> Keypair:
 
 def _get_rent_exempt_minimum() -> int:
     try:
-        return solana.get_minimum_balance_for_rent_exemption(0).value
+        return rpc_call_with_retry(solana.get_minimum_balance_for_rent_exemption, 0).value
     except Exception:
         return 2_500_000  # fallback
 
@@ -339,7 +355,7 @@ def sweep_game_wallet_to_house(gid: int) -> Optional[str]:
         return None
 
     try:
-        bal = int(solana.get_balance(src_pk).value)
+        bal = int(rpc_call_with_retry(solana.get_balance, src_pk).value)
     except Exception as e:
         logger.error(f"[sweep] Game #{gid} failed to get balance: {e}")
         return None
@@ -384,10 +400,11 @@ def sweep_game_wallet_to_house(gid: int) -> Optional[str]:
     txn = Transaction.new_unsigned(msg)
 
     try:
-        blk = solana.get_latest_blockhash(commitment="confirmed").value.blockhash
+        blk = rpc_call_with_retry(solana.get_latest_blockhash, commitment="confirmed").value.blockhash
         txn.sign([kp], blk)
         raw = bytes(txn)
-        res = solana.send_raw_transaction(
+        res = rpc_call_with_retry(
+            solana.send_raw_transaction,
             raw, 
             opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed", max_retries=15)
         )
@@ -401,6 +418,7 @@ def sweep_game_wallet_to_house(gid: int) -> Optional[str]:
 async def _sweep_game_wallet_to_house_async(gid: int) -> Optional[str]:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: sweep_game_wallet_to_house(gid))
+
 
 # === MISC HELPERS ===
 async def safe_send(bot, chat_id, *args, **kwargs):
