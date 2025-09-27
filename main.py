@@ -1,4 +1,4 @@
-import os  
+import os   
 import random
 import json
 import logging
@@ -30,6 +30,7 @@ from solders.signature import Signature
 from solders.transaction import Transaction
 from solders.instruction import Instruction, AccountMeta
 from solders.message import Message
+from solders.system_program import TransferParams, AssignParams, transfer, assign
 
 from solana.rpc.api import Client
 from solana.rpc.types import TxOpts
@@ -309,27 +310,7 @@ def distribute_winnings(recipient_wallet: str, amount: float):
 
     return win_sig, fee_sig, float(net), float(fee)
 
-# === GAME WALLET SWEEP (DYNAMIC RENT FIX) ===
-def _estimate_fee_for_message(msg: Message) -> int:
-    try:
-        res = rpc_call_with_retry(solana.get_fee_for_message, msg)
-        fee = getattr(res, "value", None)
-        if isinstance(fee, int):
-            return max(fee, 5_000)
-        return 10_000
-    except Exception:
-        return 10_000
-
-def _is_plain_system_account(pubkey: Pubkey) -> bool:
-    try:
-        ai = rpc_call_with_retry(solana.get_account_info, pubkey).value
-        if not ai:
-            return True
-        owner = str(ai.owner)
-        return owner == "11111111111111111111111111111111"
-    except Exception:
-        return True
-
+# === GAME WALLET SWEEP (CLOSE ACCOUNT) ===
 def _load_game_keypair(gid: int) -> Keypair:
     try:
         with open(GAMES_FILE, "r") as f:
@@ -339,20 +320,10 @@ def _load_game_keypair(gid: int) -> Keypair:
     except Exception as e:
         raise RuntimeError(f"Missing or unreadable key for game {gid}: {e}")
 
-def _get_rent_exempt_minimum() -> int:
-    try:
-        return rpc_call_with_retry(solana.get_minimum_balance_for_rent_exemption, 0).value
-    except Exception:
-        return 2_500_000  # fallback
-
 def sweep_game_wallet_to_house(gid: int) -> Optional[str]:
     kp = _load_game_keypair(gid)
     src_pk = kp.pubkey()
     dst_pk = Pubkey.from_string(HOUSE_WALLET)
-
-    if not _is_plain_system_account(src_pk):
-        logger.warning(f"[sweep] Game #{gid} source is not a plain System account; skipping sweep.")
-        return None
 
     try:
         bal = int(rpc_call_with_retry(solana.get_balance, src_pk).value)
@@ -361,42 +332,19 @@ def sweep_game_wallet_to_house(gid: int) -> Optional[str]:
         return None
 
     if bal <= 0:
+        logger.info(f"[sweep] Game #{gid} wallet empty.")
         return None
 
-    placeholder_lamports = 1
-    data = (2).to_bytes(4, "little") + placeholder_lamports.to_bytes(8, "little")
-    draft_ix = Instruction(
-        program_id=Pubkey.from_string("11111111111111111111111111111111"),
-        accounts=[
-            AccountMeta(src_pk, is_signer=True, is_writable=True),
-            AccountMeta(dst_pk, is_signer=False, is_writable=True),
-        ],
-        data=data,
-    )
-    draft_msg = Message([draft_ix], payer=src_pk)
-
-    fee_est = _estimate_fee_for_message(draft_msg)
-    rent_min = _get_rent_exempt_minimum()
-
-    keep_min = max(rent_min, fee_est + 20_000)
-    if bal <= keep_min:
+    fee_est = 5000
+    lamports_to_send = bal - fee_est
+    if lamports_to_send <= 0:
+        logger.info(f"[sweep] Game #{gid} balance too low to sweep (bal={bal}).")
         return None
 
-    lamports_to_send = bal - keep_min
-    if lamports_to_send < 20_000:
-        return None
+    ix1 = transfer(TransferParams(from_pubkey=src_pk, to_pubkey=dst_pk, lamports=lamports_to_send))
+    ix2 = assign(AssignParams(pubkey=src_pk, program_id=Pubkey.from_string("11111111111111111111111111111111")))
 
-    real_data = (2).to_bytes(4, "little") + lamports_to_send.to_bytes(8, "little")
-    ix = Instruction(
-        program_id=Pubkey.from_string("11111111111111111111111111111111"),
-        accounts=[
-            AccountMeta(src_pk, is_signer=True, is_writable=True),
-            AccountMeta(dst_pk, is_signer=False, is_writable=True),
-        ],
-        data=real_data,
-    )
-
-    msg = Message([ix], payer=src_pk)
+    msg = Message([ix1, ix2], payer=src_pk)
     txn = Transaction.new_unsigned(msg)
 
     try:
@@ -405,11 +353,11 @@ def sweep_game_wallet_to_house(gid: int) -> Optional[str]:
         raw = bytes(txn)
         res = rpc_call_with_retry(
             solana.send_raw_transaction,
-            raw, 
+            raw,
             opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed", max_retries=15)
         )
         sig = str(res.value)
-        logger.info(f"[sweep] Game #{gid} → HOUSE {HOUSE_WALLET}: {lamports_to_send} lamports ({solscan(sig)})")
+        logger.info(f"[sweep] CLOSED Game #{gid} → HOUSE {HOUSE_WALLET}: {lamports_to_send} lamports ({solscan(sig)})")
         return sig
     except Exception as e:
         logger.error(f"[sweep] Game #{gid} sweep failed: {e}")
@@ -418,7 +366,6 @@ def sweep_game_wallet_to_house(gid: int) -> Optional[str]:
 async def _sweep_game_wallet_to_house_async(gid: int) -> Optional[str]:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: sweep_game_wallet_to_house(gid))
-
 
 # === MISC HELPERS ===
 async def safe_send(bot, chat_id, *args, **kwargs):
