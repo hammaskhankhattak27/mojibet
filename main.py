@@ -335,33 +335,48 @@ def sweep_game_wallet_to_house(gid: int) -> Optional[str]:
         logger.info(f"[sweep] Game #{gid} wallet empty.")
         return None
 
-    fee_est = 5000
+    fee_est = 5000  # approx transaction fee
     lamports_to_send = bal - fee_est
     if lamports_to_send <= 0:
         logger.info(f"[sweep] Game #{gid} balance too low to sweep (bal={bal}).")
         return None
 
-    ix1 = transfer(TransferParams(from_pubkey=src_pk, to_pubkey=dst_pk, lamports=lamports_to_send))
-    ix2 = assign(AssignParams(pubkey=src_pk, program_id=Pubkey.from_string("11111111111111111111111111111111")))
-
-    msg = Message([ix1, ix2], payer=src_pk)
-    txn = Transaction.new_unsigned(msg)
+    # Build transfer + assign instructions
+    ix1 = transfer(
+        TransferParams(from_pubkey=src_pk, to_pubkey=dst_pk, lamports=lamports_to_send)
+    )
+    ix2 = assign(
+        AssignParams(pubkey=src_pk, program_id=Pubkey.from_string("11111111111111111111111111111111"))
+    )
 
     try:
-        blk = rpc_call_with_retry(solana.get_latest_blockhash, commitment="confirmed").value.blockhash
+        # Create transaction directly from instructions
+        txn = Transaction.new_unsigned([ix1, ix2], payer=src_pk)
+
+        # Get blockhash & sign
+        blk = rpc_call_with_retry(
+            solana.get_latest_blockhash, commitment="confirmed"
+        ).value.blockhash
         txn.sign([kp], blk)
+
+        # Serialize and send
         raw = bytes(txn)
         res = rpc_call_with_retry(
             solana.send_raw_transaction,
             raw,
-            opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed", max_retries=15)
+            opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed", max_retries=15),
         )
         sig = str(res.value)
-        logger.info(f"[sweep] CLOSED Game #{gid} → HOUSE {HOUSE_WALLET}: {lamports_to_send} lamports ({solscan(sig)})")
+
+        logger.info(
+            f"[sweep] CLOSED Game #{gid} → HOUSE {HOUSE_WALLET}: "
+            f"{lamports_to_send} lamports ({solscan(sig)})"
+        )
         return sig
     except Exception as e:
         logger.error(f"[sweep] Game #{gid} sweep failed: {e}")
         return None
+
 
 async def _sweep_game_wallet_to_house_async(gid: int) -> Optional[str]:
     loop = asyncio.get_running_loop()
@@ -679,10 +694,16 @@ async def join(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Fetch tx
         try:
-            res = solana.get_transaction(sig, encoding="jsonParsed", commitment="confirmed")
+            res = rpc_call_with_retry(
+                solana.get_transaction,
+                sig,
+                encoding="jsonParsed",
+                commitment="confirmed"
+            )
         except Exception as e:
-            logger.warning(f"RPC error fetching tx {tx}: {e}")
-            return await m.reply_text("❌ Could not verify the transaction (RPC error). Please try again shortly.")
+            logger.warning(f"[join] Failed to fetch tx {tx} after retries: {type(e).__name__}")
+            return await m.reply_text("❌ Could not verify the transaction. Please try again in a moment.")
+
 
         if not res or not res.value:
             return await m.reply_text("❌ Transaction not found or not confirmed yet.")
