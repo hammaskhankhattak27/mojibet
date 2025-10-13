@@ -282,15 +282,22 @@ async def _safe_distribute(recipient_wallet: str, amount: float):
 
 def distribute_winnings(recipient_wallet: str, amount: float):
     fee = (Decimal(str(amount)) * HOUSE_FEE_RATE).quantize(Decimal("0.00000001"))
-    net = (Decimal(str(amount)) - fee).quantize(Decimal("0.00000001"))
+    # Calculate rent fee per payout (same logic as refund)
+    rent_min = _get_rent_exempt_minimum()
+    buffer_lamports = 100_000  # match sweep buffer
+    total_rent_fee = Decimal(str((rent_min + buffer_lamports) / 1_000_000_000))
+    rent_fee_per_user = total_rent_fee  # For winnings, assume single payout; for refunds, divided per user
+
+    net = (Decimal(str(amount)) - fee - rent_fee_per_user).quantize(Decimal("0.00000001"))
 
     kp = _get_payout_signer()
     paying_from_house = (str(kp.pubkey()) == HOUSE_WALLET)
 
     needed = _lamports_from_sol(net) + (0 if paying_from_house else _lamports_from_sol(fee)) + FEE_BUFFER_LAMPORTS
     bal = _get_signer_balance_lamports(kp)
+    logger.info(f"[payout] Checking payout signer balance: {str(kp.pubkey())} has {bal} lamports (~{bal/1_000_000_000:.6f} SOL), needs {needed} lamports")
     if bal < needed:
-        raise RuntimeError(f"Insufficient payout balance (have {bal} lamports, need {needed}).")
+        raise RuntimeError(f"Insufficient payout balance (have {bal} lamports, need {needed}). Payout signer: {str(kp.pubkey())}")
 
     if paying_from_house:
         fee_sig = "retained"
@@ -299,7 +306,7 @@ def distribute_winnings(recipient_wallet: str, amount: float):
 
     win_sig = payout(recipient_wallet, float(net), from_signer=kp)
 
-    logger.info(f"[payout] gross={amount} net={net} fee={fee} fee_sig={fee_sig} to={recipient_wallet} win_sig={win_sig}")
+    logger.info(f"[payout] gross={amount} net={net} fee={fee} rent_fee={rent_fee_per_user} fee_sig={fee_sig} to={recipient_wallet} win_sig={win_sig}")
 
     logger.info(f"[+] Paid {net} to winner/refund: {recipient_wallet} ({win_sig})")
     if paying_from_house:
@@ -307,7 +314,7 @@ def distribute_winnings(recipient_wallet: str, amount: float):
     else:
         logger.info(f"[+] Fee {fee} sent to house wallet: {HOUSE_WALLET} ({fee_sig})")
 
-    return win_sig, fee_sig, float(net), float(fee)
+    return win_sig, fee_sig, float(net), float(fee), float(rent_fee_per_user)
 
 # === GAME WALLET SWEEP (DYNAMIC RENT FIX) ===
 def _estimate_fee_for_message(msg: Message) -> int:
@@ -965,11 +972,21 @@ async def _finish_with_draw_and_refund(context, gid, reason: str):
 
     lines = [f"🤝 Game #{gid} ended in a draw ({reason}).", "All entries refunded:"]
 
+    # Calculate rent fee per user
+    num_players = len(g["players"])
+    rent_min = _get_rent_exempt_minimum()
+    buffer_lamports = 100_000  # match sweep buffer
+    total_rent_fee = Decimal(str((rent_min + buffer_lamports) / 1_000_000_000))
+    rent_fee_per_user = (total_rent_fee / Decimal(str(num_players))).quantize(Decimal("0.00000001"))
+
     for pu, pdata in g["players"].items():
         ref = g["amt"]
         try:
-            win_sig, fee_sig, net_amount, fee = await _safe_distribute(pdata["wallet"], ref)
-            lines.append(f"@{pdata['username']} → {net_amount} SOL ({pdata['wallet']})")
+            # Refund minus house fee and rent fee
+            fee = (Decimal(str(ref)) * HOUSE_FEE_RATE).quantize(Decimal("0.00000001"))
+            net = (Decimal(str(ref)) - fee - rent_fee_per_user).quantize(Decimal("0.00000001"))
+            win_sig = payout(pdata["wallet"], float(net))
+            lines.append(f"@{pdata['username']} → {net} SOL ({pdata['wallet']}) (fee: {fee}, rent: {rent_fee_per_user})")
             await safe_send(
                 context.bot, pu,
                 f"🔄 Game #{gid} draw/refund sent to your wallet.\n{solscan(win_sig)}"
