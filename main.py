@@ -140,7 +140,7 @@ def _save_db(data: dict):
         with DB_FILE.open("w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        logger.error(f"DB save error: {e}")
+        logger.exception(f"DB save error: {e}")
 
 def _ensure_user(data: dict, user_id: int) -> dict:
     users = data.setdefault("users", {})
@@ -212,7 +212,7 @@ def _store_failed_payout(game_id: int, recipient: str, amount: float, reason: st
         })
         json.dump(data, open(FAILED_PAYOUTS_FILE, "w"), indent=2)
     except Exception as e:
-        logger.error(f"Failed to persist failed payout: {e}")
+        logger.exception(f"Failed to persist failed payout: {e}")
 
 def store_key(gid, kp):
     priv = b58encode(bytes(kp)).decode()
@@ -238,7 +238,10 @@ def _lamports_from_sol(amt: float | Decimal) -> int:
 def _get_signer_balance_lamports(kp: Optional[Keypair] = None) -> int:
     kp = kp or _get_payout_signer()
     try:
-        resp = rpc_call_with_retry(solana.get_balance, kp.pubkey())
+        resp = rpc_call_with_retry(
+            solana.get_balance,
+            Pubkey.from_string(str(src_pk))
+        )
         return int(resp.value)
     except Exception:
         return 0
@@ -362,9 +365,13 @@ def sweep_game_wallet_to_house(gid: int) -> Optional[str]:
         return None
 
     try:
-        bal = int(rpc_call_with_retry(solana.get_balance, src_pk).value)
+        bal = int(rpc_call_with_retry(
+            solana.get_balance,
+            Pubkey.from_string(str(src_pk))
+        ).value)
+        # bal = int(rpc_call_with_retry(solana.get_balance, src_pk).value)
     except Exception as e:
-        logger.error(f"[sweep] Game #{gid} failed to get balance: {e}")
+        logger.exception(f"[sweep] Game #{gid} failed to get balance: {e}")
         return None
 
     if bal <= 0:
@@ -423,7 +430,7 @@ def sweep_game_wallet_to_house(gid: int) -> Optional[str]:
         logger.info(f"[sweep] Game #{gid} → HOUSE {HOUSE_WALLET}: {lamports_to_send} lamports ({solscan(sig)})")
         return sig
     except Exception as e:
-        logger.error(f"[sweep] Game #{gid} sweep failed: {e}")
+        logger.exception(f"[sweep] Game #{gid} sweep failed: {e}")
         return None
 
 async def _sweep_game_wallet_to_house_async(gid: int) -> Optional[str]:
@@ -909,7 +916,7 @@ async def _finish_with_winner(context, gid, winner_uid):
     try:
         await _sweep_game_wallet_to_house_async(gid)
     except Exception as e:
-        logger.error(f"[sweep] Game #{gid} sweep failed: {e}")
+        logger.exception(f"[sweep] Game #{gid} sweep failed: {e}")
 
     prize = g["amt"] * g["num"]
     wall = g["players"][winner_uid]["wallet"]
@@ -919,7 +926,7 @@ async def _finish_with_winner(context, gid, winner_uid):
         win_sig, fee_sig, net_amount, fee = await _safe_distribute(wall, prize)
         prize_line = f"Prize paid: {net_amount} SOL → {wall}\n{solscan(win_sig)}"
     except Exception as e:
-        logger.error(f"Payout failed for Game #{gid}: {e}")
+        logger.exception(f"Payout failed for Game #{gid}: {e}")
         _store_failed_payout(gid, wall, prize, str(e))
         prize_line = f"⚠️ Payout could not be sent automatically. Support will contact you.\nReason: {e}"
 
@@ -968,7 +975,7 @@ async def _finish_with_draw_and_refund(context, gid, reason: str):
     try:
         await _sweep_game_wallet_to_house_async(gid)
     except Exception as e:
-        logger.error(f"[sweep] Game #{gid} sweep failed: {e}")
+        logger.exception(f"[sweep] Game #{gid} sweep failed: {e}")
 
     lines = [f"🤝 Game #{gid} ended in a draw ({reason}).", "All entries refunded:"]
 
@@ -993,7 +1000,7 @@ async def _finish_with_draw_and_refund(context, gid, reason: str):
             )
             db.update_stats(pu, delta_draw=1, delta_profit_sol=Decimal("0"))
         except Exception as e:
-            logger.error(f"Refund payout failed for Game #{gid}, user {pu}: {e}")
+            logger.exception(f"Refund payout failed for Game #{gid}, user {pu}: {e}")
             _store_failed_payout(gid, pdata["wallet"], ref, str(e))
             lines.append(f"@{pdata['username']} → refund pending (payout error).")
 
@@ -1162,7 +1169,7 @@ async def retry_failed_payouts(context: ContextTypes.DEFAULT_TYPE):
             sig = payout(recipient, amount)
             logger.info(f"[retry] ✅ Retried payout {amount} SOL → {recipient} ({sig})")
         except Exception as e:
-            logger.error(f"[retry] ❌ Retry failed for {recipient}: {e}")
+            logger.exception(f"[retry] ❌ Retry failed for {recipient}: {e}")
             rec["reason"] = str(e)
             rec["ts"] = int(time.time())
             still_failed.append(rec)
