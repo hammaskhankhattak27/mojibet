@@ -267,7 +267,7 @@ def payout(to_addr, amt_sol, *, from_signer: Optional[Keypair] = None) -> str:
     msg = Message([ix], payer=fpk)
     txn = Transaction.new_unsigned(msg)
 
-    blk = rpc_call_with_retry(solana.get_latest_blockhash, commitment="finalized").value.blockhash
+    blk = rpc_call_with_retry(solana.get_latest_blockhash, commitment="processed").value.blockhash
     txn.sign([kp], blk)
 
     raw = bytes(txn)
