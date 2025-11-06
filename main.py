@@ -236,15 +236,18 @@ def _lamports_from_sol(amt: float | Decimal) -> int:
     return int(Decimal(str(amt)) * Decimal(1_000_000_000))
 
 def _get_signer_balance_lamports(kp: Optional[Keypair] = None) -> int:
+    """
+    Return lamports for the provided keypair (or the payout signer).
+    Returns 0 on RPC error but logs the error (doesn't swallow silently).
+    """
     kp = kp or _get_payout_signer()
     try:
-        resp = rpc_call_with_retry(
-            solana.get_balance,
-            Pubkey.from_string(str(src_pk))
-        )
+        resp = rpc_call_with_retry(solana.get_balance, kp.pubkey())
         return int(resp.value)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[balance] Failed to get balance for {kp.pubkey()}: {e}")
         return 0
+
 
 # === PAYOUTS ===
 def payout(to_addr, amt_sol, *, from_signer: Optional[Keypair] = None) -> str:
@@ -284,6 +287,13 @@ async def _safe_distribute(recipient_wallet: str, amount: float):
         return await loop.run_in_executor(None, lambda: distribute_winnings(recipient_wallet, amount))
 
 def distribute_winnings(recipient_wallet: str, amount: float):
+    """
+    Send fee to house (unless paying_from_house) and send net to recipient.
+    This function:
+     - computes fee, rent, net
+     - waits/retries for payout signer balance to reflect sweep (RPC eventual consistency)
+     - sends transactions and returns (win_sig, fee_sig, net_float, fee_float)
+    """
     fee = (Decimal(str(amount)) * HOUSE_FEE_RATE).quantize(Decimal("0.00000001"))
     # Calculate rent fee per payout (same logic as refund)
     rent_min = _get_rent_exempt_minimum()
@@ -297,27 +307,57 @@ def distribute_winnings(recipient_wallet: str, amount: float):
     paying_from_house = (str(kp.pubkey()) == HOUSE_WALLET)
 
     needed = _lamports_from_sol(net) + (0 if paying_from_house else _lamports_from_sol(fee)) + FEE_BUFFER_LAMPORTS
-    bal = _get_signer_balance_lamports(kp)
-    logger.info(f"[payout] Checking payout signer balance: {str(kp.pubkey())} has {bal} lamports (~{bal/1_000_000_000:.6f} SOL), needs {needed} lamports")
-    if bal < needed:
-        raise RuntimeError(f"Insufficient payout balance (have {bal} lamports, need {needed}). Payout signer: {str(kp.pubkey())}")
 
-    if paying_from_house:
-        fee_sig = "retained"
+    # --- Retry balance check to allow RPC to update after sweep ---
+    bal = 0
+    for attempt in range(6):  # ~ up to ~12s of waiting (1.5s, 3s, 4.5s, ...)
+        bal = _get_signer_balance_lamports(kp)
+        logger.info(f"[payout] Checking payout signer balance (attempt {attempt+1}/6): {str(kp.pubkey())} has {bal} lamports (~{bal/1_000_000_000:.6f} SOL), needs {needed} lamports")
+        if bal >= needed:
+            break
+        # if it's the last attempt, don't raise yet — log and proceed to a final check
+        if attempt < 5:
+            time.sleep(1.5 * (attempt + 1))
     else:
-        fee_sig = payout(HOUSE_WALLET, float(fee), from_signer=kp)
+        # If we exit the loop without break, last read is bal — if still zero, log warning but proceed.
+        logger.warning(f"[payout] Balance still low after retries (have {bal}, need {needed}). Will attempt payouts anyway; if send fails it will be captured.")
 
-    win_sig = payout(recipient_wallet, float(net), from_signer=kp)
+    # Final defensive check (do not raise to avoid false negatives due to RPC cache)
+    if bal < (needed - FEE_BUFFER_LAMPORTS * 0.5):  # very conservative threshold
+        logger.warning(f"[payout] Balance lower than expected (have {bal}, need {needed}). Proceeding but send may fail.")
 
-    logger.info(f"[payout] gross={amount} net={net} fee={fee} rent_fee={rent_fee_per_user} fee_sig={fee_sig} to={recipient_wallet} win_sig={win_sig}")
+    fee_sig = "retained"
+    # First send fee to house if not paying_from_house
+    if not paying_from_house:
+        try:
+            fee_sig = payout(HOUSE_WALLET, float(fee), from_signer=kp)
+            logger.info(f"[payout] Fee sent to house: {fee} SOL ({fee_sig})")
+        except Exception as e:
+            logger.exception(f"[payout] Failed to send fee to house wallet: {e}")
+            # Try to continue to send winner payout — but record fee failure
+            fee_sig = None
 
-    logger.info(f"[+] Paid {net} to winner/refund: {recipient_wallet} ({win_sig})")
+    # Now send the winner payout
+    win_sig = None
+    try:
+        win_sig = payout(recipient_wallet, float(net), from_signer=kp)
+        logger.info(f"[payout] Paid {net} to winner/refund: {recipient_wallet} ({win_sig})")
+    except Exception as e:
+        logger.exception(f"[payout] Failed to send winnings to {recipient_wallet}: {e}")
+        # propagate by re-raising so _safe_distribute() / caller handles (store failed payout)
+        raise
+
+    # Logging for house retention / fee
     if paying_from_house:
-        logger.info(f"[+] Fee {fee} retained in house wallet: {HOUSE_WALLET}")
+        logger.info(f"[payout] Fee {fee} retained in house wallet: {HOUSE_WALLET}")
     else:
-        logger.info(f"[+] Fee {fee} sent to house wallet: {HOUSE_WALLET} ({fee_sig})")
+        if fee_sig:
+            logger.info(f"[payout] Fee {fee} sent to house wallet: {HOUSE_WALLET} ({fee_sig})")
+        else:
+            logger.warning(f"[payout] Fee {fee} could not be sent to house (fee_sig=None)")
 
-    return win_sig, fee_sig, float(net), float(fee), float(rent_fee_per_user)
+    return win_sig, fee_sig, float(net), float(fee)
+
 
 # === GAME WALLET SWEEP (DYNAMIC RENT FIX) ===
 def _estimate_fee_for_message(msg: Message) -> int:
@@ -914,7 +954,11 @@ async def _finish_with_winner(context, gid, winner_uid):
         return
 
     try:
-        await _sweep_game_wallet_to_house_async(gid)
+        sig = await _sweep_game_wallet_to_house_async(gid)
+        if sig:
+            logger.info(f"[sweep] sweep sig: {sig} — waiting briefly for RPC to reflect new balance")
+            # slight pause to help public RPCs catch up (optional)
+            time.sleep(1.5)
     except Exception as e:
         logger.exception(f"[sweep] Game #{gid} sweep failed: {e}")
 
@@ -973,7 +1017,11 @@ async def _finish_with_draw_and_refund(context, gid, reason: str):
         return
 
     try:
-        await _sweep_game_wallet_to_house_async(gid)
+        sig = await _sweep_game_wallet_to_house_async(gid)
+        if sig:
+            logger.info(f"[sweep] sweep sig: {sig} — waiting briefly for RPC to reflect new balance")
+            # slight pause to help public RPCs catch up (optional)
+            time.sleep(1.5)
     except Exception as e:
         logger.exception(f"[sweep] Game #{gid} sweep failed: {e}")
 
